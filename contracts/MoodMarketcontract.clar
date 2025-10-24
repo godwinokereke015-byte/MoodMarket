@@ -1,9 +1,11 @@
 ;; title: MoodMarket - Prediction Markets for Collective Emotional States
-;; version: 1.0.0
+;; version: 2.0.0
 ;; summary: A decentralized prediction market platform for betting on societal mood shifts and happiness indices
 ;; description: This contract enables users to create and participate in prediction markets based on collective emotional states,
 ;;              using aggregated data from biometric sensors, social media sentiment, weather patterns, and significant events.
 ;;              It includes mechanisms for market creation, betting, resolution, and mental health fund allocation.
+;; security: This contract implements multiple security measures including reentrancy protection, access control,
+;;           input validation, and oracle security to ensure the safety of user funds and data.
 
 ;; traits
 (define-trait mood-oracle-trait
@@ -30,7 +32,17 @@
 (define-constant ERR-ORACLE-ERROR (err u110))
 (define-constant ERR-ALREADY-CLAIMED (err u111))
 
+;; Access roles
+(define-constant ROLE-ADMIN (some 'SP3FBR2AGK5H9QBDH3EBN6Q87FWJ6W208VZ1CK3DE))
+(define-constant ROLE-ORACLE (some 'SP3FBR2AGK5H9QBDH3EBN6Q87FWJ6W208VZ1CK3DE))
+(define-constant PROPOSAL-TIMELOCK u1440) ;; ~1 day in blocks
 (define-constant CONTRACT-OWNER tx-sender)
+
+;; Reentrancy protection
+(define-data-var reentrancy-lock bool false)
+
+;; Versioning
+(define-constant CONTRACT-VERSION "2.0.0")
 (define-constant MARKET-DURATION u144) ;; blocks (~24 hours)
 (define-constant RESOLUTION-WINDOW u288) ;; blocks (~48 hours after market close)
 (define-constant MINIMUM-BET u1000000) ;; 1 STX in microSTX
@@ -40,8 +52,26 @@
 ;; data vars
 (define-data-var next-market-id uint u1)
 (define-data-var mental-health-fund uint u0)
-(define-data-var authorized-oracle (optional principal) none)
+;; Oracle management
+(define-map oracles
+  { oracle: principal }
+  { active: bool, last-update: uint, stake: uint }
+)
+
+(define-constant MIN-ORACLES u3)
+(define-constant ORACLE-STAKE u100000000) ;; 100 STX minimum stake
+(define-constant SLASH-PERCENTAGE u10) ;; 10% slashing for misbehavior
+
+(define-data-var authorized-oracles uint u0)
+(define-data-var oracle-threshold uint u2) ;; 2/3 consensus required
+;; Circuit breaker
 (define-data-var contract-paused bool false)
+
+;; Emergency withdrawal queue
+(define-map withdrawal-queue
+  { user: principal, nonce: uint }
+  { amount: uint, timestamp: uint }
+)
 
 ;; data maps
 (define-map markets
@@ -97,11 +127,20 @@
 ;; public functions
 
 ;; Initialize the contract with an oracle
-(define-public (initialize (oracle principal))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
-    (asserts! (is-none (var-get authorized-oracle)) ERR-UNAUTHORIZED)
-    (var-set authorized-oracle (some oracle))
+(define-public (initialize (oracles (list 3 principal)))
+  (let (
+      (admin (unwrap! (contract-call? .clarinet-owner 'get-owner) (err u100)))
+    )
+    (asserts! (is-eq tx-sender admin) ERR-UNAUTHORIZED)
+    (asserts! (>= (len oracles) MIN-ORACLES) (err u112)) ;; ERR-INSUFFICIENT-ORACLES
+    
+    (map-set oracles { oracle: tx-sender } { 
+      active: true, 
+      last-update: block-height, 
+      stake: ORACLE-STAKE 
+    })
+    
+    (var-set authorized-oracles (len oracles))
     (ok true)
   )
 )
@@ -111,14 +150,34 @@
   (title (string-ascii 100))
   (description (string-ascii 500))
   (mood-threshold uint)
-  (resolution-source (string-ascii 50)))
+  (resolution-source (string-ascii 50))
+  (min-bet uint)
+  (max-bet uint)
   (let
     (
       (market-id (var-get next-market-id))
       (current-block (get-block))
     )
-    (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
+    (asserts! (not (var-get reentrancy-lock)) ERR-UNAUTHORIZED)
+    (asserts! (map-has-key? oracles { oracle: tx-sender }) ERR-UNAUTHORIZED)
+    (let ((oracle-data (unwrap! (map-get? oracles { oracle: tx-sender }) ERR-UNAUTHORIZED)))
+      (asserts! (get active oracle-data) ERR-UNAUTHORIZED)
+      
+      ;; Verify signature
+      (asserts! (verify-signature (hash160 (concat (to-uint-be market-id) (to-uint-be mood-threshold))) tx-sender (none)) 
+        (err u119)) ;; ERR-INVALID-SIGNATURE
+      
+      ;; Update oracle's last activity
+      (map-set oracles { oracle: tx-sender } (merge oracle-data {
+        last-update: block-height
+      }))
+    )
     (asserts! (and (>= mood-threshold u0) (<= mood-threshold MOOD-SCALE-MAX)) ERR-INVALID-PREDICTION)
+    (asserts! (>= (len title) u10) (err u113)) ;; ERR-TITLE-TOO-SHORT
+    (asserts! (<= (len title) u100) (err u114)) ;; ERR-TITLE-TOO-LONG
+    (asserts! (>= (len description) u50) (err u115)) ;; ERR-DESCRIPTION-TOO-SHORT
+    (asserts! (>= min-bet MINIMUM-BET) (err u116)) ;; ERR-INVALID-MIN-BET
+    (asserts! (<= max-bet (* min-bet u100)) (err u117)) ;; ERR-INVALID-MAX-BET
     
     (map-set markets
       { market-id: market-id }
@@ -145,7 +204,7 @@
 )
 
 ;; Place a bet on a market
-(define-public (place-bet (market-id uint) (prediction bool) (amount uint))
+(define-public (place-bet (market-id uint) (prediction bool) (amount uint) (commitment-hash (buff 32)))
   (let
     (
       (market (unwrap! (map-get? markets { market-id: market-id }) ERR-INVALID-MARKET))
@@ -156,12 +215,28 @@
       (bet-amount (- amount mental-health-fee))
     )
     (asserts! (not (var-get contract-paused)) ERR-UNAUTHORIZED)
-    (asserts! (>= amount MINIMUM-BET) ERR-INVALID-AMOUNT)
+    (asserts! (not (var-get reentrancy-lock)) ERR-UNAUTHORIZED
+    (asserts! (>= amount (get min-bet market)) ERR-INVALID-AMOUNT)
+    (asserts! (<= amount (get max-bet market)) ERR-INVALID-AMOUNT)
     (asserts! (< (get-block) (get closes-at market)) ERR-MARKET-CLOSED)
+    (asserts! (>= (get-block) (+ (get created-at market) u144)) ERR-MARKET-TOO-NEW) ;; 1 day cooldown
     (asserts! (not (get resolved market)) ERR-ALREADY-RESOLVED)
+    
+    ;; Verify commitment hash
+    (asserts! (is-eq (sha256 (concat (to-uint-be tx-sender) (to-uint-be amount))) commitment-hash) 
+      (err u118)) ;; ERR-INVALID-COMMITMENT
+    
+    ;; Set reentrancy lock
+    (var-set reentrancy-lock true)
     
     ;; Transfer STX from user
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Emit event
+    (print { event: "bet-placed", user: tx-sender, market-id: market-id, amount: amount })
+    
+    ;; Release reentrancy lock
+    (var-set reentrancy-lock false)
     
     ;; Update mental health fund
     (var-set mental-health-fund (+ (var-get mental-health-fund) mental-health-fee))
@@ -208,7 +283,7 @@
 )
 
 ;; Resolve a market using oracle data
-(define-public (resolve-market (market-id uint))
+(define-public (oracle-report (market-id uint) (score uint) (signature (buff 65)))
   (let
     (
       (market (unwrap! (map-get? markets { market-id: market-id }) ERR-INVALID-MARKET))
